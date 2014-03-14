@@ -1,0 +1,246 @@
+#!/usr/bin/python -tt
+
+# Twisted takes care of our TCP and UDP ports.
+from twisted.internet import reactor, task
+from twisted.internet.protocol import Protocol, DatagramProtocol, \
+                                      ProcessProtocol, Factory
+
+# Command line arguments follow the GNU conventions.
+from getopt import gnu_getopt, GetoptError
+from sys import argv, stderr, exit
+
+# Configuration is stored in a boring ini file.
+from ConfigParser import ConfigParser
+
+
+class MotionFactory(Factory):
+    def __init__(self, recorder):
+        self.recorder = recorder
+
+    def buildProtocol(self, addr):
+        return MotionProtocol(self.recorder)
+
+
+class VideoProtocol(DatagramProtocol):
+    def __init__(self, recorder):
+        self.recorder = recorder
+
+    def datagramReceived(self, data, (host, port)):
+        self.recorder.collect(data)
+
+
+class MotionProtocol(Protocol):
+    def __init__(self, recorder):
+        self.recorder = recorder
+
+    def connectionMade(self):
+        print 'motion client connected'
+
+    def connectionLost(self, reason):
+        print 'motion client disconnected'
+
+    def dataReceived(self, data):
+        print 'motion received %i bytes' % (len(data),)
+        print 'motion: ' + data
+        self.recorder.motion()
+
+
+class MuxerProtocol(ProcessProtocol):
+    def __init__(self, recorder, path):
+        self.recorder = recorder
+        self.buffers = []
+        self.status = None
+
+        argv = ['ffmpeg', '-y', '-i', '/dev/fd/0',
+                          '-c:a', 'copy', '-c:v', 'copy', path]
+
+        reactor.spawnProcess(self, argv[0], argv, {})
+
+    def connectionMade(self):
+        print 'muxing started'
+
+        for buf in self.buffers:
+            self.transport.write(buf)
+
+        self.buffers = None
+
+    def processEnded(self, reason):
+        self.status = reason
+        self.buffers = None
+        self.recorder.muxing_complete(self)
+
+    def write(self, data):
+        if self.buffers is None:
+            self.transport.write(data)
+        else:
+            self.buffers.append(data)
+
+    def close(self):
+        self.transport.closeStdin()
+
+
+class Recorder(object):
+    def __init__(self, backlog, timeout, temp, path):
+        self.timeout = timeout
+        self.path = path
+        self.temp = temp
+
+        self.buffers = [[]] * backlog
+
+        self.timeout_call = None
+        self.muxer = None
+
+        self.ticker = task.LoopingCall(self.tick)
+        self.ticker.start(1.0)
+
+    def collect(self, data):
+        self.buffers[-1].append(data)
+
+        if self.muxer is not None:
+            self.muxer.write(data)
+
+    def motion(self):
+        print 'motion detected'
+
+        if self.timeout_call is None:
+            if self.muxer is None:
+                self.timeout_call = reactor.callLater(self.timeout,
+                                                      self.motion_timeout)
+                self.muxer = MuxerProtocol(self, self.temp)
+
+                for second in self.buffers:
+                    for buf in second:
+                        self.muxer.write(buf)
+            else:
+                print 'not yet finished muxing previous file'
+        else:
+            self.timeout_call.reset(self.timeout)
+
+    def motion_timeout(self):
+        print 'motion timeout'
+
+        self.timeout_call = None
+        self.muxer.close()
+
+    def muxing_complete(self, muxer):
+        print 'muxing complete'
+
+        self.muxer = None
+
+        # TODO: move the temporary file
+
+    def tick(self):
+        old = self.buffers.pop(0)
+        self.buffers.append([])
+
+
+class Snapshotter(object):
+    def __init__(self, host, port, path, temp, frequency):
+        self.host = host
+        self.port = port
+        self.path = path
+        self.temp = temp
+
+        self.ticker = task.LoopingCall(self.tick)
+        self.ticker.start(frequency)
+
+    def tick(self):
+        print 'take snapshot'
+
+
+if __name__ == '__main__':
+    def do_start(config):
+        # Read the individual configuration options.
+        video_backlog = int(config.get('video', 'backlog'))
+        video_temp    = config.get('video', 'temp')
+        video_path    = config.get('video', 'path')
+        video_listen  = config.get('video', 'listen')
+
+        video_host, video_port = video_listen.rsplit(':', 1)
+        video_port = int(video_port)
+
+        motion_timeout = int(config.get('motion', 'timeout'))
+        motion_listen  = config.get('motion', 'listen')
+
+        motion_host, motion_port = motion_listen.rsplit(':', 1)
+        motion_port = int(motion_port)
+
+        snapshot_frequency = int(config.get('snapshot', 'frequency'))
+        snapshot_connect   = config.get('snapshot', 'connect')
+        snapshot_path      = config.get('snapshot', 'path')
+        snapshot_temp      = config.get('snapshot', 'temp')
+
+        snapshot_host, snapshot_port = snapshot_connect.rsplit(':', 1)
+        snapshot_port = int(snapshot_port)
+
+        # Create a Snapshotter for image context.
+        snapshotter = Snapshotter(snapshot_host,
+                                  snapshot_port,
+                                  snapshot_path,
+                                  snapshot_temp,
+                                  snapshot_frequency)
+
+        # Create Recorder for video context.
+        recorder = Recorder(video_backlog,
+                            motion_timeout,
+                            video_temp,
+                            video_path)
+
+        # Listen for motion events.
+        reactor.listenTCP(motion_port,
+                          MotionFactory(recorder),
+                          interface=motion_host)
+
+        # Listen for video stream.
+        reactor.listenUDP(video_port,
+                          VideoProtocol(recorder),
+                          interface=video_host)
+
+        # Run twisted.
+        reactor.run()
+
+
+    def do_help(*args, **kwargs):
+        print 'Usage: cam-keeper [--config=/etc/cam/keeper.ini]'
+        print 'Runs the camera Keeper daemon with given configuration.'
+        print ''
+        print 'OPTIONS:'
+        print '  --help, -h          Display this help.'
+        print '  --version, -V       Display version info.'
+        print ''
+        print '  --config, -c file   Load alternative configuration file.'
+        print '                      Defaults to /etc/cam/keeper.ini.'
+        print ''
+        print 'Report bugs at <http://github.com/mordae/cam/>.'
+
+    def do_version(*args, **kwargs):
+        print 'keeper (Mordae) 1'
+
+    # Parse command line arguments.
+    try:
+        opts, args = gnu_getopt(argv, 'hVc:', ['help', 'version', 'config='])
+    except GetoptError, e:
+        print >>stderr, e
+        print >>stderr, 'Try `cam-keeper --help` for more information.'
+        exit(1)
+
+    action = do_start
+    config_path = '/etc/cam/keeper.ini'
+
+    for k, v in opts:
+        if k in ('--help', '-h'):
+            action = do_help
+        elif k in ('--version', '-V'):
+            action = do_version
+        elif k in ('--config', '-c'):
+            config_path = v
+
+    # Load the configuration from file.
+    config = ConfigParser()
+    config.read(config_path)
+
+    # Perform the selected action.
+    action(config=config)
+
+# vim:set sw=4 ts=4 et:
+# -*- coding: utf-8 -*-
